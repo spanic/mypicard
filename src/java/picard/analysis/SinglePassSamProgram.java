@@ -34,6 +34,7 @@ import htsjdk.samtools.reference.ReferenceSequenceFileWalker;
 import htsjdk.samtools.util.CloserUtil;
 import htsjdk.samtools.util.IOUtil;
 import htsjdk.samtools.util.Log;
+import htsjdk.samtools.util.Objects;
 import htsjdk.samtools.util.ProgressLogger;
 import htsjdk.samtools.util.SequenceUtil;
 import picard.PicardException;
@@ -42,8 +43,16 @@ import picard.cmdline.Option;
 import picard.cmdline.StandardOptionDefinitions;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 
 /**
  * Super class that is designed to provide some consistent structure between subclasses that
@@ -126,6 +135,81 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
         final ProgressLogger progress = new ProgressLogger(log);
 
+        // MY CODE STARTS OVER HERE
+
+        // Executor, который выполняет действия с пачками из очереди queue
+        final ExecutorService service = Executors.newFixedThreadPool(4);
+
+        // Параметр, ограничивающий число пачек, находящихся в очереди одновременно
+        final int maxInQueue = 16;
+
+        // Параметр, ограничивающий число пар в пачке
+        final int maxInPack = 1000;
+
+        // Очередь, в которую записываются пачки пар по 1000 штук в каждой. Всего в очереди может одновременно
+        // находиться maxInQueue пачек
+        final BlockingQueue<List<Object[]>> queue = new LinkedBlockingQueue<>(maxInQueue);
+
+        // Пачка из пар
+        List<Object[]> pairs = new ArrayList<>(maxInPack);
+
+        // Семафор, ограничивающий число выполняемых в одном потоке задач по обработке пар. Всего одновременно
+        // может обрабатываться 4 пары в одном потоке
+        final Semaphore maxInThread = new Semaphore(4);
+
+        // Описание действий Executor'а
+        final boolean finalAnyUseNoRefReads = anyUseNoRefReads;
+        service.execute(new Runnable() {
+            @Override
+            public void run() {
+                while (true) {
+                    try {
+
+                        // Копирование пачки во временную переменную
+                        final List<Object[]> tempPairs = queue.take();
+
+                        if (tempPairs.isEmpty()) break;
+
+                        // Получение разрешения от семафора (если оно доступно)
+                        maxInThread.acquire();
+
+                        service.submit(new Runnable() {
+                            @Override
+                            public void run() {
+                                for (Object[] object : tempPairs) {
+                                    SAMRecord rec = (SAMRecord) object[0];
+                                    ReferenceSequence ref = (ReferenceSequence) object[1];
+
+                                    // Выполнение необходимых расчетов для каждой пары из пачки
+                                    for (final SinglePassSamProgram program : programs) {
+                                        program.acceptRead(rec, ref);
+                                    }
+
+                                    // Запись прогресса
+                                    progress.record(rec);
+
+                                    // See if we need to terminate early?
+                                    if (stopAfter > 0 && progress.getCount() >= stopAfter) {
+                                        break;
+                                    }
+
+                                    // And see if we're into the unmapped reads at the end
+                                    if (!finalAnyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        // Освобождение разрешения от семафора
+                        maxInThread.release();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        });
+
         for (final SAMRecord rec : in) {
             final ReferenceSequence ref;
             if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
@@ -134,20 +218,21 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                 ref = walker.get(rec.getReferenceIndex());
             }
 
-            for (final SinglePassSamProgram program : programs) {
-                program.acceptRead(rec, ref);
-            }
+            // Добавление пары в пачку
+            pairs.add(new Object[]{rec, ref});
 
-            progress.record(rec);
+            // Проверка на заполнение пачки.
+            if (pairs.size() == maxInPack) {
 
-            // See if we need to terminate early?
-            if (stopAfter > 0 && progress.getCount() >= stopAfter) {
-                break;
-            }
+                // Запись пачки в очередь
+                try {
+                    queue.put(pairs);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
 
-            // And see if we're into the unmapped reads at the end
-            if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                break;
+                // Очистка пачки
+                pairs = new ArrayList<>(maxInPack);
             }
         }
 
@@ -155,6 +240,13 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
         for (final SinglePassSamProgram program : programs) {
             program.finish();
+        }
+
+        // Посылаем Executor'у "отравленную пилюлю"
+        try {
+            queue.put(Collections.emptyList());
+        } catch (InterruptedException e) {
+            e.printStackTrace();
         }
     }
 
