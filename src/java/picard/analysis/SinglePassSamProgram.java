@@ -138,13 +138,13 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         // MY CODE STARTS OVER HERE
 
         // Executor, который выполняет действия с пачками из очереди queue
-        final ExecutorService service = Executors.newFixedThreadPool(4);
+        final ExecutorService service = Executors.newFixedThreadPool(50);
 
         // Параметр, ограничивающий число пачек, находящихся в очереди одновременно
-        final int maxInQueue = 16;
+        final int maxInQueue = 10;
 
         // Параметр, ограничивающий число пар в пачке
-        final int maxInPack = 1000;
+        final int maxInPack = 500;
 
         // Очередь, в которую записываются пачки пар по 1000 штук в каждой. Всего в очереди может одновременно
         // находиться maxInQueue пачек
@@ -155,7 +155,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
         // Семафор, ограничивающий число выполняемых в одном потоке задач по обработке пар. Всего одновременно
         // может обрабатываться 4 пары в одном потоке
-        final Semaphore maxInThread = new Semaphore(4);
+        final Semaphore maxInThread = new Semaphore(5);
 
         // Описание действий Executor'а
         final boolean finalAnyUseNoRefReads = anyUseNoRefReads;
@@ -203,6 +203,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
                         // Освобождение разрешения от семафора
                         maxInThread.release();
+
                     } catch (InterruptedException e) {
                         e.printStackTrace();
                     }
