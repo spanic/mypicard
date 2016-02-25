@@ -141,7 +141,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 
         // Параметр, ограничивающий число пачек, находящихся в очереди одновременно
-        final int maxInQueue = 2;
+        final int maxInQueue = 10;
 
         // Параметр, ограничивающий число пар в пачке
         final int maxInPack = 1000;
@@ -152,9 +152,6 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
         // Пачка из пар
         ArrayList<Object[]> pairs = new ArrayList<>(maxInPack);
-
-        // Семафор, ограничивающий число выполняемых в одном потоке задач по обработке пар.
-        final Semaphore maxInThread = new Semaphore(10);
 
         // Описание действий Executor'а
         final boolean finalAnyUseNoRefReads = anyUseNoRefReads;
@@ -167,10 +164,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                         // Копирование пачки во временную переменную
                         final List<Object[]> tempPairs = queue.take();
 
-                        if (tempPairs.isEmpty()) break;
-
-                        // Получение разрешения от семафора (если оно доступно)
-                        maxInThread.acquire();
+                        if (isStopped || tempPairs.isEmpty()) break;
 
                         service.execute(new Runnable() {
                             @Override
@@ -189,20 +183,18 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
                                     // See if we need to terminate early?
                                     if (stopAfter > 0 && progress.getCount() >= stopAfter) {
-                                        sendPoisonPill(queue);
+                                        stop();
                                         break;
                                     }
 
                                     // And see if we're into the unmapped reads at the end
                                     if (!finalAnyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                                        stop();
                                         break;
                                     }
                                 }
                             }
                         });
-
-                        // Освобождение разрешения от семафора
-                        maxInThread.release();
 
                     } catch (InterruptedException e) {
                         e.printStackTrace();
@@ -212,32 +204,56 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         });
 
         for (final SAMRecord rec : in) {
-            final ReferenceSequence ref;
-            if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                ref = null;
-            } else {
-                ref = walker.get(rec.getReferenceIndex());
-            }
-
-            // Добавление пары в пачку
-            pairs.add(new Object[]{rec, ref});
-
-            // Проверка на заполнение пачки.
-            if (pairs.size() == maxInPack) {
-
-                // Запись пачки в очередь
-                try {
-                    queue.put(pairs);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
+            if (!isStopped) {
+                final ReferenceSequence ref;
+                if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                    ref = null;
+                } else {
+                    ref = walker.get(rec.getReferenceIndex());
                 }
 
-                // Очистка пачки
-                pairs = new ArrayList<>(maxInPack);
-            }
+                // Добавление пары в пачку
+                pairs.add(new Object[]{rec, ref});
+
+                // Проверка на заполнение пачки.
+                if (pairs.size() == maxInPack) {
+
+                    // Запись пачки в очередь
+                    try {
+                        queue.put(pairs);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+
+                    // Очистка пачки
+                    pairs = new ArrayList<>(maxInPack);
+                }
+            } else break;
         }
 
         sendPoisonPill(queue);
+
+        // Проверка на наличие пар в неотправленной пачке и работа с ними
+        if (pairs.size() > 0) {
+            for (Object[] pair : pairs) {
+                SAMRecord rec = (SAMRecord) pair[0];
+                ReferenceSequence ref = (ReferenceSequence) pair[1];
+
+                for (final SinglePassSamProgram program : programs) {
+                    program.acceptRead(rec, ref);
+                }
+
+                progress.record(rec);
+
+                if (stopAfter > 0 && progress.getCount() >= stopAfter) {
+                    break;
+                }
+
+                if (!finalAnyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                    break;
+                }
+            }
+        }
 
         CloserUtil.close(in);
 
@@ -246,6 +262,13 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         }
     }
 
+    // Триггер активности потоков
+    private static boolean isStopped = false;
+    private static void stop() {
+        isStopped = true;
+    }
+
+    // Отправка "отравленной пилюли"
     private static void sendPoisonPill(final BlockingQueue<List<Object[]>> queue) {
         try {
             queue.put(Collections.emptyList());
