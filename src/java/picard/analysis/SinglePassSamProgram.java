@@ -138,24 +138,23 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         // MY CODE STARTS OVER HERE
 
         // Executor, который выполняет действия с пачками из очереди queue
-        final ExecutorService service = Executors.newFixedThreadPool(50);
+        final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 
         // Параметр, ограничивающий число пачек, находящихся в очереди одновременно
-        final int maxInQueue = 10;
+        final int maxInQueue = 2;
 
         // Параметр, ограничивающий число пар в пачке
-        final int maxInPack = 500;
+        final int maxInPack = 1000;
 
-        // Очередь, в которую записываются пачки пар по 1000 штук в каждой. Всего в очереди может одновременно
+        // Очередь, в которую записываются пачки пар. Всего в очереди может одновременно
         // находиться maxInQueue пачек
         final BlockingQueue<List<Object[]>> queue = new LinkedBlockingQueue<>(maxInQueue);
 
         // Пачка из пар
-        List<Object[]> pairs = new ArrayList<>(maxInPack);
+        ArrayList<Object[]> pairs = new ArrayList<>(maxInPack);
 
-        // Семафор, ограничивающий число выполняемых в одном потоке задач по обработке пар. Всего одновременно
-        // может обрабатываться 4 пары в одном потоке
-        final Semaphore maxInThread = new Semaphore(5);
+        // Семафор, ограничивающий число выполняемых в одном потоке задач по обработке пар.
+        final Semaphore maxInThread = new Semaphore(10);
 
         // Описание действий Executor'а
         final boolean finalAnyUseNoRefReads = anyUseNoRefReads;
@@ -173,7 +172,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                         // Получение разрешения от семафора (если оно доступно)
                         maxInThread.acquire();
 
-                        service.submit(new Runnable() {
+                        service.execute(new Runnable() {
                             @Override
                             public void run() {
                                 for (Object[] object : tempPairs) {
@@ -190,6 +189,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
                                     // See if we need to terminate early?
                                     if (stopAfter > 0 && progress.getCount() >= stopAfter) {
+                                        sendPoisonPill(queue);
                                         break;
                                     }
 
@@ -237,13 +237,16 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
             }
         }
 
+        sendPoisonPill(queue);
+
         CloserUtil.close(in);
 
         for (final SinglePassSamProgram program : programs) {
             program.finish();
         }
+    }
 
-        // Посылаем Executor'у "отравленную пилюлю"
+    private static void sendPoisonPill(final BlockingQueue<List<Object[]>> queue) {
         try {
             queue.put(Collections.emptyList());
         } catch (InterruptedException e) {
