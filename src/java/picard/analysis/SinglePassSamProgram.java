@@ -49,6 +49,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -135,106 +136,94 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
         final ProgressLogger progress = new ProgressLogger(log);
 
-        // MY CODE STARTS OVER HERE
+        /** MY CODE STARTS OVER HERE */
 
-        // Executor, который выполняет действия с пачками из очереди queue
+        /** Executor, который выполняет действия с пачками */
         final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 
-        // Параметр, ограничивающий число пачек, находящихся в очереди одновременно
-        final int maxInQueue = 10;
-
-        // Параметр, ограничивающий число пар в пачке
+        /** Параметр, ограничивающий число пар в пачке */
         final int maxInPack = 1000;
 
-        // Очередь, в которую записываются пачки пар. Всего в очереди может одновременно
-        // находиться maxInQueue пачек
-        final BlockingQueue<List<Object[]>> queue = new LinkedBlockingQueue<>(maxInQueue);
-
-        // Пачка из пар
+        /** Пачка из пар */
         ArrayList<Object[]> pairs = new ArrayList<>(maxInPack);
 
-        // Описание действий Executor'а
-        final boolean finalAnyUseNoRefReads = anyUseNoRefReads;
-        service.execute(new Runnable() {
-            @Override
-            public void run() {
-                while (true) {
-                    try {
+        /** Параметр, ограничивающий число одновременно обрабатываемых пачек */
+        final int maxInProcess = 8;
 
-                        // Копирование пачки во временную переменную
-                        final List<Object[]> tempPairs = queue.take();
-
-                        if (isStopped || tempPairs.isEmpty()) break;
-
-                        service.execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                for (Object[] object : tempPairs) {
-                                    SAMRecord rec = (SAMRecord) object[0];
-                                    ReferenceSequence ref = (ReferenceSequence) object[1];
-
-                                    // Выполнение необходимых расчетов для каждой пары из пачки
-                                    for (final SinglePassSamProgram program : programs) {
-                                        program.acceptRead(rec, ref);
-                                    }
-
-                                    // Запись прогресса
-                                    progress.record(rec);
-
-                                    // See if we need to terminate early?
-                                    if (stopAfter > 0 && progress.getCount() >= stopAfter) {
-                                        stop();
-                                        break;
-                                    }
-
-                                    // And see if we're into the unmapped reads at the end
-                                    if (!finalAnyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                                        stop();
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }
-        });
+        /** Семафор, ограничивающий число одновременно обрабатываемых пачек */
+        Semaphore semaphore = new Semaphore(maxInProcess);
 
         for (final SAMRecord rec : in) {
-            if (!isStopped) {
-                final ReferenceSequence ref;
-                if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                    ref = null;
-                } else {
-                    ref = walker.get(rec.getReferenceIndex());
+
+            /** Проверка на состоявшееся завершение программы */
+            if (isStopped) break;
+
+            final ReferenceSequence ref;
+            if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                ref = null;
+            } else {
+                ref = walker.get(rec.getReferenceIndex());
+            }
+
+            /** Добавление пары в пачку */
+            pairs.add(new Object[]{rec, ref});
+
+            /** Проверка на заполнение пачки */
+            if (pairs.size() == maxInPack) {
+
+                /** Получение разрешения у семафора */
+                try {
+                    semaphore.acquire();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
                 }
 
-                // Добавление пары в пачку
-                pairs.add(new Object[]{rec, ref});
+                /** Передача пачки на обработку Executor'у */
+                final ArrayList<Object[]> sentPairs = pairs;
+                final boolean finalAnyUseNoRefReads = anyUseNoRefReads;
+                service.submit(new Runnable() {
+                    @Override
+                    public void run() {
 
-                // Проверка на заполнение пачки.
-                if (pairs.size() == maxInPack) {
+                        for (Object[] pair : sentPairs) {
+                            SAMRecord rec = (SAMRecord) pair[0];
+                            ReferenceSequence ref = (ReferenceSequence) pair[1];
 
-                    // Запись пачки в очередь
-                    try {
-                        queue.put(pairs);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
+                            /** Запуск алгоритмов обработки */
+                            for (final SinglePassSamProgram program : programs) {
+                                program.acceptRead(rec, ref);
+                            }
+
+                            /** Запись прогресса */
+                            progress.record(rec);
+
+                            /** See if we need to terminate early? */
+                            if (stopAfter > 0 && progress.getCount() >= stopAfter) {
+                                stop();
+                                break;
+                            }
+
+                            /** And see if we're into the unmapped reads at the end */
+                            if (!finalAnyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                                stop();
+                                break;
+                            }
+                        }
                     }
+                });
 
-                    // Очистка пачки
-                    pairs = new ArrayList<>(maxInPack);
-                }
-            } else break;
+                /** Освобождение разрешения у семафора */
+                semaphore.release();
+
+                // Очистка пачки
+                pairs = new ArrayList<>(maxInPack);
+            }
         }
 
-        sendPoisonPill(queue);
+        service.shutdown();
 
-        // Проверка на наличие пар в неотправленной пачке и работа с ними
-        if (pairs.size() > 0) {
+        /** Проверка на наличие пар в не заполненной до конца пачке и их обработка */
+        if (pairs.size() > 0 && !isStopped) {
             for (Object[] pair : pairs) {
                 SAMRecord rec = (SAMRecord) pair[0];
                 ReferenceSequence ref = (ReferenceSequence) pair[1];
@@ -249,7 +238,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                     break;
                 }
 
-                if (!finalAnyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                     break;
                 }
             }
@@ -266,15 +255,6 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
     private static boolean isStopped = false;
     private static void stop() {
         isStopped = true;
-    }
-
-    // Отправка "отравленной пилюли"
-    private static void sendPoisonPill(final BlockingQueue<List<Object[]>> queue) {
-        try {
-            queue.put(Collections.emptyList());
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
     }
 
     /** Can be overriden and set to false if the section of unmapped reads at the end of the file isn't needed. */
